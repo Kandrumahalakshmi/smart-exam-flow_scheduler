@@ -1,0 +1,493 @@
+You can build this as a Smart Exam Flow Scheduler using Java Spring Boot as the backend. The important thing is to understand that this is not just a CRUD application for creating exams and rooms. It is a scheduling system that must make decisions, prevent conflicts, explain failures, and maintain an audit trail.
+
+Since you have already been working with Spring Boot entities and repositories for this project, we'll build on that foundation rather than start from scratch.
+
+# 1. Understand the business workflow
+
+Imagine a college needs to schedule 300 exams for 5,000 students. Each exam needs a suitable room, a time slot, and available invigilators. Some students require extra time or special facilities.
+
+The system should automatically find a valid schedule and explain why it cannot schedule an exam when no valid option exists.
+
+Step 1 — Prepare master data
+
+Students, courses, enrollments, exams, rooms and invigilators
+
+Step 2 — Validate business rules
+
+Enrollment counts, room capacities, accommodations and availability
+
+Step 3 — Build the conflict graph
+
+Identify exams that cannot happen at the same time
+
+Step 4 — Generate a schedule
+
+Choose valid time slots, rooms and invigilators
+
+Step 5 — Validate and save decisions
+
+Persist assignments, exceptions, history and ground-truth labels
+
+Step 6 — Report results
+
+Scheduled exams, unscheduled exams, conflict reasons and utilization metrics
+
+## 2. How the workflow works in a real example
+
+Suppose three exams have the following requirements:
+
+| Exam               | Students | Duration | Special requirement         |
+| ------------------ | -------- | -------- | --------------------------- |
+| Java               | 80       | 120 min  | Projector                   |
+| Database           | 45       | 90 min   | None                        |
+| Accessibility exam | 20       | 120 min  | Extra time, accessible room |
+
+Your available rooms are:
+
+| Room        | Capacity | Equipment  |
+| ----------- | -------- | ---------- |
+| ROOM-000001 | 100      | Projector  |
+| ROOM-000002 | 50       | None       |
+| ROOM-000003 | 25       | Accessible |
+
+The scheduling engine should reason as follows:
+
+1. Java needs a room with at least 80 seats and a projector, so ROOM-000001 is suitable.
+2. Database needs at least 45 seats, so ROOM-000002 is suitable.
+3. The accessibility exam must be assigned a room that meets its accessibility requirement, and its actual duration must include the extra time.
+4. If Java and Database share enrolled students, their exam time intervals must not overlap.
+5. If no room satisfies an exam's requirements, the exam remains unscheduled with a reason such as `NO_SUITABLE_ROOM`.
+
+The system should not force an invalid assignment just to make every exam appear scheduled.
+
+# 3. Design the database before writing the scheduler
+
+Use Java 21 + Spring Boot + Spring Data JPA + PostgreSQL for the first version. Keep the backend as a modular monolith: one Spring Boot application with clearly separated packages. You do not need microservices for this project.
+
+Your required entities fit into these groups.
+
+## A. Master data
+
+| Entity        | Purpose                    | Example primary key |
+| ------------- | -------------------------- | ------------------- |
+| `Student`     | Student information        | `STU-000001`        |
+| `Course`      | Course details             | `CRS-000001`        |
+| `Room`        | Room details and equipment | `ROOM-000001`       |
+| `Invigilator` | Staff details              | `INV-000001`        |
+
+## B. Academic and scheduling data
+
+| Entity               | Purpose                                       | Important relationship            |
+| -------------------- | --------------------------------------------- | --------------------------------- |
+| `Enrollment`         | Connects students to courses                  | Student + Course                  |
+| `Exam`               | Exam date window, course and status           | Course                            |
+| `ExamRequirement`    | Duration, equipment and special requirements  | Exam                              |
+| `RoomCapacity`       | Capacity effective for a given period         | Room                              |
+| `Availability`       | When an invigilator or room is available      | Resource                          |
+| `Accommodation`      | Extra time, accessible seating or other needs | Student; optionally exam-specific |
+| `ScheduleAssignment` | Records an exam's scheduled room and time     | Exam + Room                       |
+
+You also need two supporting tables:
+
+- `RoomEquipment` — a bridge table connecting rooms to equipment types, unless your existing implementation already models this relationship.
+- `AssignmentEvent` or `ScheduleEvent` — records assignment, cancellation, rescheduling and other state changes without erasing history.
+
+### Understand the relationships
+
+Core relationship map
+
+Student
+
+1 : N
+
+Enrollment
+
+N : 1
+
+Course
+
+Course
+
+1 : N
+
+Exam
+
+1 : 1 (or 1 : N if multiple requirements)
+
+ExamRequirement
+
+Exam
+
+1 : N over assignment history
+
+ScheduleAssignment
+
+N : 1
+
+Room
+
+A few design decisions matter:
+
+- A student can enroll in multiple courses, and a course can have multiple students. `Enrollment` resolves this many-to-many relationship.
+- An exam can have multiple requirements, so one exam may require a projector, accessibility features and extended duration.
+- A room can have multiple pieces of equipment, and an equipment type can exist in multiple rooms.
+- An exam can have multiple historical assignments, but at most one active assignment at a time.
+- An invigilator can supervise multiple exams at different times. If one exam requires multiple invigilators, use an `AssignmentInvigilator` bridge table.
+- Use effective start/end dates for room capacities and availability when they can change over time.
+
+Important: Don't use the room ID as the only key for `RoomCapacity`, because capacity can change. Give each capacity record its own primary key and retain its effective dates.
+
+## 4. Data dictionary: fields you should implement
+
+Start with a practical subset and expand it when the basic scheduling flow works.
+
+| Entity             | Suggested fields                                                                                       |
+| ------------------ | ------------------------------------------------------------------------------------------------------ |
+| Student            | `id`, `name`, `status`                                                                                 |
+| Course             | `id`, `code`, `name`, `status`                                                                         |
+| Enrollment         | `id`, `student_id`, `course_id`, `status`, `enrolled_at`                                               |
+| Exam               | `id`, `course_id`, `earliest_start`, `latest_end`, `base_duration_minutes`, `status`                   |
+| ExamRequirement    | `id`, `exam_id`, `requirement_type`, `requirement_value`, `mandatory`                                  |
+| Room               | `id`, `name`, `status`                                                                                 |
+| RoomCapacity       | `id`, `room_id`, `capacity`, `effective_from`, `effective_to`                                          |
+| Invigilator        | `id`, `name`, `status`                                                                                 |
+| Availability       | `id`, `resource_type`, `resource_id`, `start_time`, `end_time`, `availability_status`                  |
+| Accommodation      | `id`, `student_id`, `exam_id`, `accommodation_type`, `extra_minutes`, `effective_from`, `effective_to` |
+| ScheduleAssignment | `id`, `exam_id`, `room_id`, `start_time`, `end_time`, `status`, `decision_reason`, `created_at`        |
+
+For `Availability`, you can initially store the resource type as `ROOM` or `INVIGILATOR`. Note that a polymorphic `resource_id` does not enforce a database foreign key to both tables. If you want full referential integrity, use separate `RoomAvailability` and `InvigilatorAvailability` tables, or a shared resource table.
+
+### Validation rules
+
+- All IDs must be unique and immutable.
+- `Enrollment` must reference an existing student and course; enforce a unique student/course pair for active enrollments.
+- Duration and capacity must be positive integers.
+- End times must be later than start times.
+- Availability and capacity records must have valid effective-date ranges.
+- Accommodation records must reference a valid student, with an optional exam-specific reference.
+- Active assignments must reference valid exams and rooms.
+- A cancelled assignment must remain in history rather than being deleted.
+
+Use Java enums for controlled values such as `SCHEDULED`, `UNSCHEDULED`, `CANCELLED`, `AVAILABLE`, and `CLOSED`. Use explicit reason codes rather than free-form text as the primary exception identifier.
+
+# 5. Build the scheduling engine — the most important part
+
+The scheduler is the business brain of the application. Keep it in a dedicated service rather than putting scheduling logic inside a controller or JPA entity.
+
+## Step 1: Calculate the actual exam duration
+
+Suppose an exam normally lasts 120 minutes, but three enrolled students need 30 extra minutes each.
+
+The exam's scheduled duration must be long enough for all accommodated students to finish.
+
+\\[ D\_{\text{actual}} = D\_{\text{base}} + \max(D\_{\text{extra}}) \\]
+
+In this example, the duration is \\(120 + 30 = 150\\) minutes, assuming the accommodation is an extra 30 minutes.
+
+Do not add everyone's extra time together. Also, if your institution uses a percentage-based accommodation, implement that as a separately documented rule.
+
+## Step 2: Build the conflict graph
+
+A conflict graph represents exams that cannot happen simultaneously.
+
+- Each vertex represents an exam.
+- An edge connects two exams that share at least one enrolled student.
+- Connected exams cannot have overlapping time intervals.
+
+Example:
+
+Java and Database may run together only if they share no students; both conflict with Networks in this example.
+
+For every pair of exams, you can compare their enrolled student IDs. For larger datasets, build the graph efficiently by grouping exams by student instead of comparing every exam against every other exam.
+
+A basic interval-overlap check is:
+
+```
+boolean overlaps(
+        LocalDateTime startA,
+        LocalDateTime endA,
+        LocalDateTime startB,
+        LocalDateTime endB
+) {
+    return startA.isBefore(endB)
+            && startB.isBefore(endA);
+}
+```
+
+This treats exams ending exactly when another begins as non-overlapping.
+
+## Step 3: Generate candidate assignments
+
+For every exam, generate possible combinations of:
+
+- A valid time slot.
+- A room with sufficient effective capacity.
+- Required equipment and accessibility features.
+- A room that is open for the entire exam duration.
+- Available invigilators with no overlapping assignments.
+
+Reject any combination that violates a hard constraint.
+
+## Step 4: Choose which exam to schedule first
+
+Do not simply schedule exams in database order. That could assign a flexible exam first and leave a difficult exam with no options.
+
+Use a heuristic called most constrained first:
+
+1. Find the unscheduled exam with the fewest valid candidate assignments.
+2. Try its valid candidates.
+3. Prefer candidates that preserve the most options for remaining exams.
+4. If no candidate is valid, leave the exam unscheduled and record the reason.
+5. Revalidate the final schedule before publishing it.
+
+For a first version, use a deterministic greedy algorithm. If it cannot find a feasible schedule, add backtracking or a constraint solver later. A greedy algorithm is not guaranteed to find a solution even when one exists.
+
+### Reason codes
+
+Define reason codes centrally in an enum, for example:
+
+| Reason code               | Meaning                                                    |
+| ------------------------- | ---------------------------------------------------------- |
+| `NO_SUITABLE_ROOM`        | No room satisfies capacity or mandatory requirements       |
+| `NO_VALID_TIME_SLOT`      | No slot satisfies exam windows and room availability       |
+| `INVIGILATOR_UNAVAILABLE` | No eligible invigilator can cover the required period      |
+| `STUDENT_CONFLICT`        | Candidate overlaps an exam for an enrolled student         |
+| `RESOURCE_CONFLICT`       | Room or invigilator is already assigned during that period |
+| `ACCOMMODATION_UNMET`     | A required accommodation cannot be satisfied               |
+
+Keep the primary reason and any additional blocking reasons in the scheduling result. If several constraints fail, choose the primary reason using a documented priority rule.
+
+## Step 5: Validate before saving
+
+The final validation must check the whole schedule, not just each exam individually.
+
+- No student has overlapping exams.
+- No room hosts overlapping exams.
+- No invigilator is double-booked.
+- Every assignment respects room capacity, equipment and availability.
+- All accommodations are satisfied.
+- Every scheduled exam has a matching active assignment.
+- Every unscheduled exam has a documented reason.
+
+If validation fails, do not publish the schedule. Record the failed run and its issues so you can diagnose the failure.
+
+# 6. Spring Boot project architecture
+
+Keep the application organized by business responsibility. Since you prefer learning the code flow step by step, this structure will make it easier to trace a request from the controller to the database.
+
+```
+src/main/java/com/example/demo/
+├── config/
+├── controller/
+│   ├── StudentController.java
+│   ├── CourseController.java
+│   ├── ExamController.java
+│   ├── RoomController.java
+│   └── SchedulingController.java
+├── dto/
+│   ├── ScheduleRequest.java
+│   ├── ScheduleResult.java
+│   └── UnscheduledExamResponse.java
+├── model/
+│   ├── Student.java
+│   ├── Course.java
+│   ├── Enrollment.java
+│   ├── Exam.java
+│   ├── ExamRequirement.java
+│   ├── Room.java
+│   ├── RoomCapacity.java
+│   ├── Invigilator.java
+│   ├── Availability.java
+│   ├── Accommodation.java
+│   └── ScheduleAssignment.java
+├── repository/
+├── service/
+│   ├── EnrollmentService.java
+│   ├── ExamService.java
+│   ├── AccommodationService.java
+│   ├── ConflictGraphService.java
+│   ├── CandidateAssignmentService.java
+│   ├── SchedulingService.java
+│   └── ScheduleValidationService.java
+├── generator/
+│   ├── SyntheticDataGenerator.java
+│   └── GroundTruthGenerator.java
+└── exception/
+```
+
+Your existing `RoomEquipment` entity and `RoomEquipmentRepository` can remain in the `model` and `repository` packages. Reuse them if they already meet the relationship and uniqueness requirements instead of creating duplicate equipment models.
+
+## 7. API endpoints to expose
+
+Start with these endpoints and add the rest as each feature becomes functional.
+
+| Method | Endpoint                             | Purpose                            |
+| ------ | ------------------------------------ | ---------------------------------- |
+| `POST` | `/api/students`                      | Create a student                   |
+| `POST` | `/api/courses`                       | Create a course                    |
+| `POST` | `/api/enrollments`                   | Enroll a student in a course       |
+| `POST` | `/api/exams`                         | Create an exam                     |
+| `POST` | `/api/rooms`                         | Create a room                      |
+| `POST` | `/api/invigilators`                  | Register an invigilator            |
+| `POST` | `/api/accommodations`                | Record an accommodation            |
+| `POST` | `/api/schedules/generate`            | Generate a proposed schedule       |
+| `GET`  | `/api/schedules/{runId}`             | Retrieve a schedule run            |
+| `GET`  | `/api/schedules/{runId}/unscheduled` | List unscheduled exams and reasons |
+| `POST` | `/api/schedules/{runId}/publish`     | Publish a validated schedule       |
+| `GET`  | `/api/reports/{runId}`               | Return evaluation metrics          |
+
+For schedule generation, the controller should be thin:
+
+```
+@RestController
+@RequestMapping("/api/schedules")
+public class SchedulingController {
+
+    private final SchedulingService schedulingService;
+
+    public SchedulingController(
+            SchedulingService schedulingService) {
+        this.schedulingService = schedulingService;
+    }
+
+    @PostMapping("/generate")
+    public ScheduleResult generateSchedule() {
+        return schedulingService.generateSchedule();
+    }
+}
+```
+
+This is an illustrative starting point. The `ScheduleResult` DTO and service method will be implemented as we build the scheduler.
+
+The eventual flow will be:
+
+`SchedulingController → SchedulingService → CandidateAssignmentService → ScheduleValidationService → Repositories`
+
+Keep generation and publication separate. Generate a proposed schedule first, validate it, and publish it only when all hard constraints pass.
+
+# 8. Generate the synthetic dataset correctly
+
+Your full dataset should contain 5,000 students, 300 exams, 100 rooms and 200 invigilators. Don't create all those records manually.
+
+Build a configurable generator with a fixed seed:
+
+```
+scheduler.generator.seed=20261022
+scheduler.generator.students=5000
+scheduler.generator.exams=300
+scheduler.generator.rooms=100
+scheduler.generator.invigilators=200
+```
+
+The generator should use these stages:
+
+1. Generate master records. Create students, courses, rooms, invigilators, equipment and availability.
+2. Generate valid relationships. Create enrollments referencing existing student and course IDs, then create exams and requirements.
+3. Generate accommodations. Link accommodations to enrolled students and calculate the effective exam duration from the documented policy.
+4. Run the scheduler. Build conflicts, assign valid rooms and time slots, and identify unscheduled exams.
+5. Inject labelled negative scenarios. Use separate test fixtures or explicitly labelled issue cases for overlapping exams, double-bookings, ignored accommodations and other failures.
+6. Export and validate. Produce CSV/JSON files, SQL seed data, ground truth, a source manifest and a validation report.
+
+### Keep ground truth separate
+
+Your `ground_truth.csv` should contain information such as:
+
+| scenario_id | issue_type                | expected_outcome  |
+| ----------- | ------------------------- | ----------------- |
+| EDGE-001    | STUDENT_OVERLAP           | REJECT_ASSIGNMENT |
+| EDGE-002    | ROOM_CAPACITY_EXCEEDED    | REJECT_ASSIGNMENT |
+| EDGE-003    | INVIGILATOR_DOUBLE_BOOKED | REJECT_ASSIGNMENT |
+| EDGE-004    | ACCOMMODATION_IGNORED     | REJECT_ASSIGNMENT |
+| EDGE-005    | ROOM_CLOSED               | REJECT_ASSIGNMENT |
+
+These are illustrative test labels, not results from an actual scheduler run.
+
+Keep the negative scenarios out of the normal valid schedule unless they are deliberately being used to test detection. Your validator should catch them, and your evaluation should confirm that it did.
+
+For reproducibility, generate the same data twice with the same seed and compare sorted exports, row counts and checksums. A fixed seed alone isn't enough if your implementation relies on unordered database results or nondeterministic iteration.
+
+# 9. What makes this a complete project?
+
+Don't stop when the APIs return successful responses. The acceptance criteria require measurable results.
+
+## Metrics dashboard
+
+Scheduling rate
+
+# —
+
+Scheduled / eligible exams
+
+Hard constraint violations
+
+# —
+
+Target: 0
+
+Room utilization
+
+# —
+
+Occupied room-time / available room-time
+
+Accommodation compliance
+
+# —
+
+Satisfied / applicable requirements
+
+These are dashboard placeholders, not measured results. Populate them only after executing the scheduling and validation pipeline.
+
+Also measure:
+
+- Number of unscheduled exams by reason code.
+- Invigilator utilization and conflicts detected.
+- Data validation failures and foreign-key violations.
+- Scheduler runtime.
+- Edge-case detection precision and recall against ground truth.
+
+Define every metric's denominator precisely. For example, accommodation compliance should count applicable accommodation requirements, not all students.
+
+# 10. Your implementation roadmap
+
+Build it in this order so each phase gives you something testable.
+
+Phase 1 — Database and entities
+
+Create entities, relationships, repositories, validation constraints and database migrations. Verify that all IDs and joins are consistent.
+
+Start here
+
+Phase 2 — Master data and enrollment APIs
+
+Implement CRUD endpoints and seed a small dataset. Verify enrollment counts and parent IDs.
+
+Phase 3 — Business rules
+
+Implement duration calculations, accommodations, availability checks and the conflict graph.
+
+Phase 4 — Scheduling algorithm
+
+Generate candidates, select assignments, explain unscheduled exams and validate the full schedule.
+
+Phase 5 — Synthetic data and testing
+
+Add seeded generation, labelled edge cases, integration tests and reproducibility checks.
+
+Phase 6 — Reporting and frontend
+
+Build schedule views, exception reports, utilization metrics and a React dashboard if a frontend is required.
+
+## Let's start with Phase 1
+
+Since you've already been working on the `RoomEquipment` entity and repository, don't rewrite the project before we inspect what you have.
+
+Please share your current:
+
+- `pom.xml`
+- `Room.java`
+- `RoomEquipment.java`
+- `RoomEquipmentRepository.java`
+- `application.properties` (hide any passwords or secrets)
+
+I'll guide you through the next changes one file at a time, explaining the entity relationships, annotations, primary keys and foreign keys, so we build the actual project rather than just a high-level design.
