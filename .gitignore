@@ -1,0 +1,16 @@
+# Java / Maven
+target/
+*.class
+
+# React / Node
+frontend/node_modules/
+frontend/dist/
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# IDE files
+.idea/
+.vscode/

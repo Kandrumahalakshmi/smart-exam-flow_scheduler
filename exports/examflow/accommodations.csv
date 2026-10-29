@@ -1,0 +1,5 @@
+id,student_id,type,extra_time_minutes,details,active
+ACC-000001,STU-000001,EXTENDED_TIME,30,30 additional exam minutes,true
+ACC-000002,STU-000002,ACCESSIBLE_ROOM,0,Accessible room required,true
+ACC-000003,STU-000003,EXTENDED_TIME,30,30 additional exam minutes,true
+ACC-000004,STU-000004,ACCESSIBLE_ROOM,0,Accessible room required,true

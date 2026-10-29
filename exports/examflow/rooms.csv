@@ -1,0 +1,6 @@
+id,name,capacity,active
+ROOM-000001,Exam Room 001,333,true
+ROOM-000002,Exam Room 002,268,true
+ROOM-000003,Exam Room 003,158,true
+ROOM-000004,Exam Room 004,308,true
+ROOM-000005,Exam Room 005,248,true
